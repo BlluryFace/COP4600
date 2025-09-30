@@ -1,0 +1,62 @@
+# ==================== CASE 3 ====================
+# echo Hello World
+echo Hello World
+# echo Hello World > /tmp/tmp.txt
+echo Hello World > /tmp/tmp.txt
+# invalid redirection
+echo Hello World > /tmp/tmp.txt > /tmp/tmp.txt
+# simple echo again
+echo Hello World
+# exit with argument
+exit now
+# proper exit
+exit
+
+# ==================== CASE 4 ====================
+# ls to a non-existent directory
+ls /abc
+# simple echo again
+echo Hello World
+# exit properly
+exit
+
+# ==================== CASE 5-10 (misc multiple prompts) ====================
+# just simulate multiple commands in a row
+echo One
+echo Two
+echo Three > /tmp/testfile
+cat /tmp/testfile
+rm -f /tmp/testfile
+exit
+
+# ==================== CASE 13-16 (external commands) ====================
+/bin/ls
+/bin/pwd
+/bin/echo External Test
+/bin/false
+exit
+
+# ==================== CASE 17 (path built-in) ====================
+path /bin /usr/bin
+ls
+exit
+
+# ==================== CASE 18-22 (redirection checks) ====================
+echo redirected > /tmp/test_output
+cat /tmp/test_output
+rm -f /tmp/test_output
+# invalid redirection only
+> output.12
+exit
+
+# ==================== CASE 23 (script execution with redirection) ====================
+path /bin /autograder/source/bin
+p2.sh > /tmp/output22
+cat /tmp/output22
+rm -f /tmp/output22
+exit
+
+# ==================== CASE 25 (whitespace handling) ====================
+
+          echo test variable whitespace!
+exit
