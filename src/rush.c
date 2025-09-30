@@ -10,12 +10,16 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
-#include <errno.h>
 
 #define MAX_INPUT 256
 #define MAX_ARGS 64
 #define MAX_PATHS 10
 #define MAX_PATH_LEN 128
+
+// global path list and size
+char **pathlist = NULL;
+int pathcount = 0;
+
 // print out error whenever error is raised
 void error() {
     //•	Writes directly to the file descriptor for stderr.
@@ -35,12 +39,12 @@ void execute_exe(char **args, int argc, char program[]) {
         if (strcmp(args[i], ">") == 0) {
             // Must have exactly one argument after '>'
             if (i != argc - 2) {
-                write(STDERR_FILENO, "An error has occurred\n", 22);
+                error();
                 return;
             }
             fd = open(args[i + 1], O_CREAT | O_WRONLY | O_TRUNC, 0644);
             if (fd < 0) {
-                perror("open failed");
+                error();
                 return;
             }
             args[i] = NULL; // truncate args at '>'
@@ -48,27 +52,27 @@ void execute_exe(char **args, int argc, char program[]) {
         }
     }
 
-    // Fork and exec
     pid_t pid = fork();
     if (pid < 0) {
         error();
     } else if (pid == 0) {
-        // Child
-        if (fd != -1) {
-            if (dup2(fd, STDOUT_FILENO) < 0) {
-                error();
-                _exit(1);
-            }
+        // child process
+        if (fd != -1){
+            dup2(fd, STDOUT_FILENO);
             close(fd);
         }
+
+        // adjust argv[0] to full path (/bin/ls)
+        args[0] = program;
         execv(program, args);
-        // If execv fails
+
+        // if exec fails
         error();
-        _exit(1);
+        exit(1);
+
     } else {
-        // Parent waits
+        // parent waits
         waitpid(pid, NULL, 0);
-        if (fd != -1) close(fd);
     }
 }
 
@@ -82,12 +86,9 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
     // Init path
-    char path_dirs[MAX_PATHS][MAX_PATH_LEN];
-    int path_count = 1;
-
-    // Initialize default path
-    strncpy(path_dirs[0], "/bin", MAX_PATH_LEN - 1);
-    path_dirs[0][MAX_PATH_LEN - 1] = '\0';  // ensure null-terminated
+    pathlist = malloc(sizeof(char*));
+    pathlist[0] = strdup("/bin");
+    pathcount = 1;
 
     char *line = NULL;
     size_t len = 0;
@@ -96,76 +97,93 @@ int main(int argc, char *argv[]) {
     while (1) {
         printf("rush> "); // The start of the command
         fflush(stdout); // Force buffer to flush word immediately into the terminal
+
         if (getline(&line, &len, stdin) == -1) {
             break; // End Of File
         }
 
-        // Parse input into args[]
-        char *args[MAX_ARGS]; // array of argument strings
-        int arg_count = 0;
-        // Splitting strings into token everytime it meets a space, tab or newline character
-        char *token = strtok(line, " \t\n");
-        while (token != NULL && arg_count < MAX_ARGS - 1) {
-            args[arg_count++] = token;
-            // Splitting strings into token everytime it meets a space, tab or newline character
-            token = strtok(NULL, " \t\n");
+        char *args[MAX_ARGS];
+        int argc = 0;
+
+        // tokenize by spaces/tabs/newline
+        char *tok = strtok(line, " \t\n");
+        while (tok != NULL && argc < MAX_ARGS-1) {
+            if (strcmp(tok, ">") == 0) {
+                // > with no command is invalid
+                if (argc == 0) {
+                    error();
+                    continue;
+                }
+                tok = strtok(NULL, " \t\n");
+                // > must have exactly one filename
+                if (tok == NULL || strtok(NULL, " \t\n") != NULL) {
+                    error();
+                    continue;
+                }
+                break;
+            } else {
+                args[argc++] = tok;
+            }
+            tok = strtok(NULL, " \t\n");
         }
-        // Signify end of arguments
-        args[arg_count] = NULL;
-        if (arg_count == 0) {
-            continue;
-        }
-        // Built-in: exit
+        args[argc] = NULL;
+
+        if (argc == 0) continue; // nothing typed
+
+        // exit takes no args
         if (strcmp(args[0], "exit") == 0) {
-            if (arg_count != 1) {
+            if (args[1] != NULL) {
                 error();
                 continue;
             }
             exit(0);
-        }
-
-            // Built-in: cd
-        else if (strcmp(args[0], "cd") == 0) {
-            if (arg_count != 2 || chdir(args[1]) != 0) {
+        } else if (strcmp(args[0], "cd") == 0) {
+            if (argc != 2 || chdir(args[1]) != 0) {
                 error();
             }
             continue;
         }
-
             // Built-in: path
         else if (strcmp(args[0], "path") == 0) {
-            path_count = argc - 1; // number of directories provided
-            if (path_count > MAX_PATHS) {
-                path_count = MAX_PATHS; // limit to max paths
+            // wipe old pathlist
+            for (int i = 0; i < pathcount; i++) {
+                free(pathlist[i]);
+            }
+            free(pathlist);
+
+            // count new paths
+            int count = 0;
+            for (int i = 1; args[i] != NULL; i++) count++;
+
+            // allocate new list
+            pathlist = malloc(sizeof(char*) * count);
+            pathcount = count;
+
+            // copy new entries
+            for (int i = 0; i < count; i++) {
+                pathlist[i] = strdup(args[i+1]);
+            }
+        } else {
+            char program[MAX_PATH_LEN + 128]; // buffer for full path
+            int found = 0; // flag to indicate if executable is found
+
+            static char full[256];
+            for (int i = 0; i < pathcount; i++) {
+                snprintf(full, sizeof(full), "%s/%s", pathlist[i], args[0]);
+                if (access(full, X_OK) == 0) {
+                    strncpy(program, full, sizeof(program) - 1);
+                    program[sizeof(program) - 1] = '\0'; // null terminate
+                    found = 1;
+                    break; // stop at first match
+                }
+            }
+            if (!found) {
+                error();      // or write to stderr
+                continue;     // skip this command
             }
 
-            for (int i = 0; i < path_count; i++) {
-                // Copy the path string safely into the fixed array
-                strncpy(path_dirs[i], args[i + 1], MAX_PATH_LEN - 1);
-                path_dirs[i][MAX_PATH_LEN - 1] = '\0'; // ensure null-termination
-            }
-
-            // If no paths are given, path_count becomes 0
-            continue;
+            execute_exe(args, argc, program);
         }
-
-        char program[MAX_PATH_LEN + 128]; // buffer for full path
-
-        // Find executable in path_dirs
-        int found = 0;
-        for (int i = 0; i < path_count; i++) {
-            snprintf(program, sizeof(program), "%s/%s", path_dirs[i], args[0]);
-            if (access(program, X_OK) == 0) {
-                found = 1;
-                break;
-            }
-        }
-        if (!found) {
-            // Not found
-            write(STDERR_FILENO, "An error has occurred\n", 22);
-            continue;
-        }
-        execute_exe(args, arg_count, program);
     }
     return 0;
 }
