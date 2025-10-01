@@ -10,7 +10,8 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
-
+#include <errno.h>
+#include <signal.h>
 #define MAX_INPUT 256
 #define MAX_ARGS 64
 #define MAX_PATHS 10
@@ -32,32 +33,20 @@ void error() {
 /// Execute commands that the user passes in
 /// \param args: parsed user's command
 /// \param argc: number of arguments
-void execute_exe(char **args, int argc, char program[]) {
-// Check for output redirection
-    int fd = -1;
-    for (int i = 0; i < argc; i++) {
-        if (strcmp(args[i], ">") == 0) {
-            // Must have exactly one argument after '>'
-            if (i != argc - 2) {
-                error();
-                return;
-            }
-            fd = open(args[i + 1], O_CREAT | O_WRONLY | O_TRUNC, 0644);
-            if (fd < 0) {
-                error();
-                return;
-            }
-            args[i] = NULL; // truncate args at '>'
-            break;
-        }
-    }
+void execute_exe(char **args, int argc, char program[], char* file) {
 
     pid_t pid = fork();
     if (pid < 0) {
         error();
     } else if (pid == 0) {
         // child process
-        if (fd != -1){
+        if (file != NULL) {
+            // handle > redirection
+            int fd = open(file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            if (fd < 0) {
+                error();
+                exit(1);
+            }
             dup2(fd, STDOUT_FILENO);
             close(fd);
         }
@@ -71,8 +60,26 @@ void execute_exe(char **args, int argc, char program[]) {
         exit(1);
 
     } else {
-        // parent waits
-        waitpid(pid, NULL, 0);
+        // parent waits but with timeout
+        int status;
+        int waited = 0;
+
+        while (waited < 50000) {   // 5-second timeout
+            pid_t result = waitpid(pid, &status, WNOHANG);
+            if (result == 0) {
+                // child still running
+                usleep(1000);
+                waited++;
+            } else {
+                // child finished
+                return;
+            }
+        }
+
+        // timeout exceeded → kill child
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0); // reap it
+        error(); // optional: notify timeout
     }
 }
 
@@ -92,44 +99,53 @@ int main(int argc, char *argv[]) {
 
     char *line = NULL;
     size_t len = 0;
-
     // Parsing user's command into arguments and count it
     while (1) {
-        printf("rush> "); // The start of the command
-        fflush(stdout); // Force buffer to flush word immediately into the terminal
+        char *file = NULL;
+        printf("rush> ");
+        fflush(stdout);
 
         if (getline(&line, &len, stdin) == -1) {
-            break; // End Of File
+            break; // EOF
         }
 
         char *args[MAX_ARGS];
-        int argc = 0;
+        int arg_count = 0;
 
-        // tokenize by spaces/tabs/newline
+        // ================= Tokenize =================
         char *tok = strtok(line, " \t\n");
-        while (tok != NULL && argc < MAX_ARGS-1) {
+        while (tok != NULL && arg_count < MAX_ARGS - 1) {
             if (strcmp(tok, ">") == 0) {
-                // > with no command is invalid
-                if (argc == 0) {
-                    error();
-                    continue;
-                }
-                tok = strtok(NULL, " \t\n");
-                // > must have exactly one filename
+                tok = strtok(NULL, " \t\n"); // filename
                 if (tok == NULL || strtok(NULL, " \t\n") != NULL) {
                     error();
-                    continue;
+                    file = NULL;
+                    arg_count = 0; // skip command
+                    break;
                 }
-                break;
+                file = tok;
+                break; // stop tokenizing after >
             } else {
-                args[argc++] = tok;
+                args[arg_count++] = tok;
             }
             tok = strtok(NULL, " \t\n");
         }
-        args[argc] = NULL;
+        args[arg_count] = NULL;
 
-        if (argc == 0) continue; // nothing typed
+        if (arg_count == 0) continue; // nothing to execute
 
+        // ============== Check for invalid redirection outside loop =================
+        if (file != NULL) {
+            int invalid_redirect = 0;
+            for (int i = 0; i < arg_count; i++) {
+                if (strcmp(args[i], file) == 0) {
+                    error();           // cannot redirect to same file being read
+                    invalid_redirect = 1;
+                    break;
+                }
+            }
+            if (invalid_redirect) continue; // skip executing
+        }
         // exit takes no args
         if (strcmp(args[0], "exit") == 0) {
             if (args[1] != NULL) {
@@ -138,32 +154,56 @@ int main(int argc, char *argv[]) {
             }
             exit(0);
         } else if (strcmp(args[0], "cd") == 0) {
-            if (argc != 2 || chdir(args[1]) != 0) {
+            if (arg_count != 2 || chdir(args[1]) != 0) {
                 error();
             }
             continue;
         }
             // Built-in: path
         else if (strcmp(args[0], "path") == 0) {
-            // wipe old pathlist
+            // free old pathlist
             for (int i = 0; i < pathcount; i++) {
                 free(pathlist[i]);
             }
             free(pathlist);
+            pathlist = NULL;
+            pathcount = 0;
 
-            // count new paths
-            int count = 0;
-            for (int i = 1; args[i] != NULL; i++) count++;
-
-            // allocate new list
-            pathlist = malloc(sizeof(char*) * count);
-            pathcount = count;
-
-            // copy new entries
-            for (int i = 0; i < count; i++) {
-                pathlist[i] = strdup(args[i+1]);
+            // if no args given -> empty pathlist
+            if (args[1] == NULL) {
+                continue;
             }
-        } else {
+
+            // temporary storage
+            char *newpaths[MAX_PATHS];
+            int count = 0;
+            int valid = 1;
+
+            for (int i = 1; args[i] != NULL; i++) {
+                if (access(args[i], X_OK) == 0) {
+                    newpaths[count++] = strdup(args[i]);
+                } else {
+                    valid = 0; // mark invalid path
+                }
+            }
+
+            if (!valid) {
+                // free allocated copies so far
+                for (int i = 0; i < count; i++) {
+                    free(newpaths[i]);
+                }
+                error();
+                continue;
+            }
+
+            // commit new pathlist
+            pathlist = malloc(sizeof(char*) * count);
+            for (int i = 0; i < count; i++) {
+                pathlist[i] = newpaths[i];
+            }
+            pathcount = count;
+        }
+        else {
             char program[MAX_PATH_LEN + 128]; // buffer for full path
             int found = 0; // flag to indicate if executable is found
 
@@ -182,7 +222,7 @@ int main(int argc, char *argv[]) {
                 continue;     // skip this command
             }
 
-            execute_exe(args, argc, program);
+            execute_exe(args, arg_count, program, file);
         }
     }
     return 0;
